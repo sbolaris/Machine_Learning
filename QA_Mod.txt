@@ -1,0 +1,2153 @@
+package ChromDB::QualityAssessment;
+
+#nomenclature:
+	#MHND = Mahalanobis Distance
+
+use version; our $VERSION = qv('3.6');
+#orginal version created by Tara Paulson
+#version 3.1 created by Stephen Bolaris 
+#with with help from Karla Gendler and Walt 
+
+#import packages 
+use strict;
+#ChromDB packages
+use ChromDB::Protein;
+use ChromDB::Domain;
+use ChromDB::ProteinSelector;
+use ChromDB::Taxon;
+#perl data language
+use PDL;
+use PDL::Matrix;
+use PDL::Ops;
+use PDL::Ufunc;
+use PDL::Slatec; #this is needed for condition number problems
+use Data::Dumper;
+#Statistics packages
+use Statistics::Distributions;
+
+
+#define package varibles
+
+#seed_mu (average)
+my %averages_of_features;
+#seed standard deviation
+my %stds_of_features;
+#zbars for the features
+my %z_bars_of_features;
+#arry to keeptrack of all seed z scores
+my @seed_z_scores;
+#array of bad feature numbers
+my @bad_feat;
+#hash of necessary features features
+my %necessary_features;
+#the covariance matrix
+my $matrix;
+#the canidate vector
+my $vector;
+#spacial limit used for color representation 
+my $d_max;
+#limit for D^2 distrobution
+my $alpha = 0.2;
+#red limit
+my $gamma = 0.05;
+#domain db to use
+my $db = "pfam";
+#z score for the canidate length
+my $canidate_z_length;
+#global for feature check
+my $has_features;
+#an array to keep track of feature order
+my @order;
+#check to see if the matrix is defined
+my $co_var_defined;
+#shows that the options are set
+my $opts = 0;
+#gives back error message
+my $errorMess = undef;
+# hash containing the seed features
+my %seeds;
+#number of seeds (for pos calc)
+my $numSeeds;
+#global verbose option
+my $verbose = 0;
+#degrees of freedom
+my $deg_free;
+# group array to allow for multiple protein groups.
+my @groups;
+my $prot_type;
+my $tester;
+my %feat_test;
+my @seed_prots = ();
+my $seed_test = 0;
+my $ret_feat = 0;
+
+my $rem_tax = 0;
+
+my $usrt = 0;
+my @user_taxa =();
+
+my $recursive =0;
+my $req_num_seeds = 4; #increase number required seeds to help with big p small n problem
+my @feature_vals = ();
+
+
+=for
+DEPRICATED
+#define sql hash (if needed) DEPRICATED
+	#my %SQL : SQL = (
+	#		insert_seed_data => q{INSERT INTO calculated_quality_data SET protein_id=?, feature=?, z_score=?, type=?},
+	#		fetch_seed_data => q{SELECT FROM calculated_quality_data WHERE protein_id=? }
+	#		); 
+=cut
+sub init(){
+	$co_var_defined =0;
+	$has_features = 0;
+	if($opts == 0){
+		$d_max = 0;
+	
+	}
+	unless($recursive == 1){
+		$req_num_seeds =4;
+	}
+	$vector = undef;
+	$matrix = undef;
+	@order = ();
+	@bad_feat = ();
+	@seed_z_scores = ();
+	%necessary_features =();
+	%averages_of_features = ();
+	%stds_of_features = ();
+	%z_bars_of_features = ();
+	$errorMess = undef;
+	%seeds = ();
+	$recursive  = 0;
+	@seed_prots =();
+	@feature_vals = ();
+	
+}
+
+#options method
+	#allow the script to be able to pass options like to get a graphical
+	#out put as well as standard text?
+	#other options? -set what cut offs should be 
+sub set_options(){
+	my $self = shift;
+	my $option = shift;
+	my $value = shift;
+	
+	if($option =~ m/dmax/i){
+		$d_max = $value;
+		$opts =1;
+	}
+	 
+	elsif($option =~ m/alpha/i){
+		$alpha = $value;
+		
+	}
+	
+	elsif($option =~ m/gamma/i){
+		$gamma = $value;
+		
+	}
+	elsif($option =~ m/db/i){
+		$db = $value;
+	}
+	elsif($option =~ m/reset/i){
+		$opts = 0;
+		ChromDB::QualityAssessment->init();
+	}
+	elsif($option =~m/verbose/){
+		$verbose = $value;
+		
+		
+	}
+	elsif($option =~m/pg/){
+		 @groups= @{$value};
+		 
+	}
+	elsif($option =~ m/seeder/i){
+		$seed_test = $value;
+	}
+	elsif($option =~ m/nf/i){
+		$ret_feat = $value;
+	
+	}
+	elsif($option =~ m/exclude/i){
+		$rem_tax = $value;
+	}
+	elsif($option =~ m/taxa/i){
+		$usrt = 1;
+		@user_taxa = @{$value};
+	}
+	elsif($option =~ m/length/i){
+		$req_num_seeds = $value;
+	}
+	else{
+		print "your option parameter did not match 'dmax', 'alpha', 'gamma', or 'db' default values will now be used";
+	}
+	
+
+}
+
+
+
+#retrieve set from user request (input)
+sub input_by_prot(){
+	#what type of input should it expect? - either protien ids and length, and e values
+	my $self = shift;
+	my $name = shift;
+	$tester = $name;
+	my %canidate_features;
+	#used in case of multiple domains under the same name
+	my $i = 0;
+	#gather protein object
+	my $prot = ChromDB::Protein->fetch($name);
+	
+	#stor protein object
+	$canidate_features{"protein"} = $prot;
+		#get length
+	my $length = $prot->fetch_protein_sequence()->get_sequence_length();
+	$canidate_features{"length"} = $length;
+		#domain data
+	my @domains = $prot->fetch_domains_by_db($db);
+	#go through all domains corrisponding to the database specified
+	foreach(@domains){
+		my $pd = $_;
+		#get domain name
+		my $domain = ChromDB::Domain->fetch($pd->get_domain())->get_name();
+		#if there are multiple domains with the same name incrament name with pipe
+		if(exists($canidate_features{$domain})){
+			$i++;
+			if($pd->get_e_value() == 0){
+				$canidate_features{$domain."|".$i} = (2**31-1);
+			}
+			else{
+				$canidate_features{$domain."|".$i} = log10($pd->get_e_value());
+			}
+		}
+		#if there is only one domain with that name or it is the first one
+		else{
+			if($pd->get_e_value() ==0){
+				$canidate_features{$domain} = (2**31-1);
+			}
+			else{
+				$canidate_features{$domain} = log10($pd->get_e_value());
+			}
+		}	
+	
+	}	
+	#return the out put that controller retuns
+	my $type = "protein";	
+	#print $type;
+	return ChromDB::QualityAssessment->controller(\%canidate_features,$type);
+
+}	#end input_by_prot()
+
+sub input_by_features(){ #expect hash of hashes refs
+	#%features{feature1} = %features 
+	my $self = shift;
+	my %features = shift;
+	return ChromDB::QualityAssessment->controller(\%features,"features");
+
+}	#end input by features
+
+
+#called by input methods to handle processing of a canidate
+#returns the out back to the input methods
+sub controller(){
+	my $self = shift;
+	my $feat = shift;
+	my $input = shift;
+	
+	
+	ChromDB::QualityAssessment->init();
+	my $name = ChromDB::Protein->fetch($tester)->get_chromdb_syn();
+	if($verbose ==1){
+		print $name."\n";
+	
+	}
+	my $phylo = ChromDB::Protein->fetch($tester)->fetch_protein_class()->get_phylogenetic_code();
+	#print "$name \n";
+	#print $input;
+	#get seeds and necessary features, and seed features
+	my %seeds_of_canidate = %{ChromDB::QualityAssessment->get_seeds($feat,$input)};
+	if($errorMess){
+			my %error; 
+			$error{"error"} = $phylo."\t".$name."\t".$errorMess;
+			$error{"prot"} = ChromDB::Protein->fetch($tester)->get_chromdb_syn();
+			$error{"seeds"} = ChromDB::QualityAssessment->generate_seed_list(\@seed_prots);
+			return \%error;
+		}
+		
+		
+	if($ret_feat ==1){
+		my @features = keys(%seeds_of_canidate);
+		my $seeds = ChromDB::QualityAssessment->generate_seed_list(\@seed_prots);
+		
+		my %hash = (
+				"feature" => \@features,
+				"seeds" => $seeds,
+			   );
+			
+		return \%hash;
+	}	
+		
+	#check that canidate has the necessary features
+	my @can_feature = ChromDB::QualityAssessment->has_necessary_features($feat);
+	#if canidate has all necessary features
+	if($has_features == 1){
+		#calculate z scores for each seed feature
+		ChromDB::QualityAssessment->calc_seed_values(\%seeds_of_canidate);
+		if($errorMess eq " Determinant is zero with out Zero feature"){
+			if($rem_tax == 0){
+				$req_num_seeds++;
+				$recursive =1;
+				return ChromDB::QualityAssessment->input_by_prot($tester);	
+			}
+			#print $errorMess."\n";		
+		}
+		
+		if($errorMess){
+			
+			my %error; 
+			
+			$error{"error"} = $phylo."\t".$name."\t".$errorMess;
+			$error{"prot"} = ChromDB::Protein->fetch($tester)->get_chromdb_syn();
+			$error{"seeds"} = ChromDB::QualityAssessment->generate_seed_list(\@seed_prots);
+			
+			return \%error;
+		}
+		#calculate z scores for each canidate feature
+		
+             	my $distance = ChromDB::QualityAssessment->calc_canidate_values($feat);
+		if($errorMess){
+		
+			my %error; 
+			$error{"error"} = $phylo."\t".$name."\t".$errorMess;
+			$error{"prot"} = ChromDB::Protein->fetch($tester)->get_chromdb_syn();
+			$error{"seeds"} = ChromDB::QualityAssessment->generate_seed_list(\@seed_prots);
+			return \%error;
+		}
+		#return the out put to user through input
+               	return ChromDB::QualityAssessment->generate_output($distance);
+	}
+	#if the canidate does not have the necessary features
+	else{
+		#return error message saying what features were missing
+		
+		my $errorMess = "$phylo\t$name\tThis canidate lacks the necessary features ";
+		if($verbose ==1){
+			print "missing ".scalar(@can_feature)." features\n";
+		}
+		foreach(@can_feature){
+			print $_." ";
+			$errorMess .= $_." ";
+			if($verbose == 1){
+				print "$name\tThis canidate lacks $_ feature";
+			}
+		}
+		
+		if($verbose ==1){
+			print "seeds are :\n";
+			print  ChromDB::QualityAssessment->generate_seed_list(\@seed_prots);
+			print "\n";
+		}
+		
+		my %error; 
+		$error{"error"} = $errorMess;
+		$error{"prot"} = ChromDB::Protein->fetch($tester)->get_chromdb_syn();
+		$error{"seeds"} = ChromDB::QualityAssessment->generate_seed_list(\@seed_prots);
+		return \%error;
+	}
+}# end controller
+
+#method to get seed based on the canidate protein,
+sub get_seeds(){
+	my $self = shift;
+	my $hash_ref = shift;
+	my %canidate = %{$hash_ref};
+	my $input_type = shift;
+	#print $input_type." this is the input type";
+	my %NF;
+	my %seed_feat;
+	#set up protein selector based on input type
+	my $prot_sel = ChromDB::ProteinSelector->new();
+	my $taxon;
+	if($input_type =~ m/protein/i){
+               	my @seed_prots;
+	       	my $protein = $canidate{"protein"};
+	       	#print $protein."is the protein";
+		my @terminal_node;
+		if(@groups == undef){
+               		@terminal_node = $protein->fetch_protein_class()->fetch_terminal_classes();
+		}
+		else{
+			
+			## for each of the groups
+			foreach my $node(@groups){
+			## get group object
+				my $prot_class = 0;
+			## push on to terminal nodes
+				push(@terminal_node, $prot_class);
+			#@terminal_node = @groups;
+			}
+			#end for
+			
+		}
+		if($verbose == 1){
+			print "Groups =";
+			foreach my $node(@terminal_node){
+				print $node->get_phylogenetic_code()."\n";	
+			}
+			
+		}
+		
+		
+		if($rem_tax == 0){
+	               if(exists($canidate{"taxon"})){
+	               $taxon = $canidate{"taxon"};
+	               #print "working ".$taxon->get_name()."\n";
+	               }
+	               else{
+	               $taxon = $protein->fetch_organism()->fetch_taxon();
+	               }
+	               
+	               if($taxon){
+	              		 my @taxa = $taxon->get_id();
+		       
+		       		if($usrt ==1){
+		       			push(@taxa, @user_taxa);
+		       
+		       		}
+	               		print @taxa;
+		       		$prot_sel->set_taxa(\@taxa);
+	               }
+	               else{
+	        	       if($verbose ==1){
+	        		       print $protein->get_chromdb_syn()." does not have taxon id\n";
+	        	       }
+	        	       $errorMess = "This protein's taxon was returned as undfined by the database";
+	        	       my %error = {"e" => $errorMess};
+	        	       return \%error;
+	               }
+		}		
+            	
+               	$prot_sel->set_seed("Y");
+               	$prot_sel->set_class(\@terminal_node);
+		
+		#### also go to line 408 to remove taxon
+	}
+	else{
+		
+		$prot_sel->set_seed("Y");
+		my $abbrev;
+		my $phylo;
+     	      	if(exists($canidate{"pg"}) && exists($canidate{"phylocode"})){
+     	     	    $abbrev = $canidate{"pg"};
+     	            $phylo = $canidate{"phylocode"};
+     	            delete($canidate{"pg"});
+     	            delete($canidate{"phylocode"});
+     	     	 }
+     	     	 else{
+     	              die and print "Error feature has has not been given proper keys for
+     	              protein group (pg) and phylogenetic code (phylocode)";
+     	     	 }
+	#need method to use Phylo code and  protein group to give correct protein class
+	# 		abbrev = group abbreviation like CHR  phylocode = phylogenetic code
+	#ChromDB::ProteinClass->fetch_pgroup_by_phycode(abbrev, phylocode);
+	my $pc = ChromDB::ProteinClass->fetch_pgroub_by_phycode($abbrev, $phylo);
+	#have to do null check since it wont return anything if it cant find it
+		#return error code
+	
+	$prot_sel->set_class($pc);
+	#enter feature data in to prot selector
+	#for input by features
+	}
+	
+	#get seeds
+	my @temp = $prot_sel->proteins();
+	if(scalar(@temp) == 0){
+		my $name = ChromDB::Protein->fetch($tester)->get_chromdb_syn();
+		$errorMess = "has no seeds availible for comparison";
+		my %s;
+		return \%s;
+	}
+	
+	if($seed_test == 1){
+		# remove test protein from the protein list
+		my $name = ChromDB::Protein->fetch($tester)->get_chromdb_syn();
+		for(my $i = 0; $i<scalar(@temp); $i++){
+			my $prot = ChromDB::Protein->fetch($temp[$i]);
+			my $prot_name = $prot->get_chromdb_syn();
+			
+			if($prot_name eq $name){
+				if($verbose){
+					print "removing seed from list";
+				
+				}
+			
+				splice(@temp, $i, 1);
+				last;
+			}
+		}
+	
+	}
+	
+	$numSeeds = scalar(@temp);
+	
+	@seed_prots = @temp;
+	#print "seeds = ".$seed_prots[1]."\t";
+	#print "temp = @temp\n";
+	
+	#get all domains for seeds
+	#finding necessary features
+	MAIN:for(my $i = 0; $i < @temp; $i++){
+              my $p = ChromDB::Protein->fetch($temp[$i]);
+      	      #returns an array with every odd being the name every even how many
+      	      #ChromDB::ProteinDomain->domain_counts_by_protein($prot,$db);
+      	      my @domain_count = ChromDB::ProteinDomain->domain_counts_by_protein($p, $db);
+      	      #print $p->get_chromdb_syn()."\t";
+      	      #print "@domain_count";
+      	      #print "\n";
+      	      if($i==0){
+      	              #print "First loop\n";
+      	              for(my $j =0; $j<@domain_count; $j = $j+2){
+      	        	      $NF{ChromDB::Domain->fetch($domain_count[$j])->get_name()} = $domain_count[$j+1];
+      	        	      
+      	              }
+      	              next MAIN;
+      	      }
+
+      	      #one array with domain names as keys => values
+      	      #print keys(%NF)."\n";
+      	      #print "Second loop\n";
+      	      #for each protein go through and:
+      	      for(my $k =0; $k<@domain_count; $k = $k+2){
+      	        	      #if its not there do nothing
+      	        	      if(exists($NF{ChromDB::Domain->fetch($domain_count[$k])->get_name()})){
+      	        		      #if domain name is there value => lower of the two;
+      	        		      if($domain_count[$k+1] < $NF{$domain_count[$k]}){
+      	        			      $NF{$domain_count[$k]} = $domain_count[$k+1];
+      	        		      }
+      	        	      }
+      	              }
+      	      #back check to make sure that the domains are constistant with all seeds
+      	      #print keys(%NF)."\n";
+      	      #print "Third Loop\n";
+
+      	      OUTER:foreach(keys %NF){
+      	              my $dom_name = $_;
+      	              for(my $l =0; $l<@domain_count; $l = $l+2){
+      	              #do backwards comparison
+      	        	      if($dom_name eq ChromDB::Domain->fetch($domain_count[$l])->get_name()){
+      	        		      #print "found $dom_name\n";
+      	        		      next OUTER;
+      	        	      }
+      	        	      if($l+2 == scalar(@domain_count)){
+      	        		      #print "DELETING $dom_name\n";
+      	        		      delete($NF{$dom_name});
+      	        	      }
+      	              }
+      	      }
+	
+	}
+	$NF{"length"} = 1;
+	%necessary_features = %NF;
+	#create seed features hash
+	#print "$numSeeds";
+	################################
+	if($rem_tax ==0){
+	###comment out to remove taxon from the equation
+	       if(( keys(%necessary_features) ==1 ||$numSeeds < $req_num_seeds) && $input_type eq "protein"){
+	               if($verbose == 1){
+	        	       while(my ($key, $val) = each(%necessary_features)){
+	        		       print $key." is the key and ".$val."is the value\n"; 
+	        		       #my @array = @{$val};
+	        		       #foreach(@array){
+
+	        		       #       print "\t".$_."\n";
+
+	        		       #}
+	        	       }
+	               }
+
+	               if(keys(%necessary_features) == 1 && $verbose == 1){
+	        	       print "only one necessary feature for the this protein\n";
+	        	       print "key =".keys(%necessary_features)."\n";
+	               }
+	               if($numSeeds < $req_num_seeds && $verbose == 1){
+	        	       print "less than 3 seeds moving to next parent\n";
+	        	       print "parent =".$taxon->fetch_parent()."\n";
+	               }
+	               #print "here";
+	               unless(keys(%necessary_features) == 1 && exists($necessary_features{"length"})){
+	        	       $canidate{"taxon"} = ($taxon->fetch_parent());
+	        	       return ChromDB::QualityAssessment->get_seeds(\%canidate,"protein");
+	               }
+	               else{
+		       
+	        	       $errorMess = "This protein contained length as its only necessary feature";
+			       if(scalar(@temp) == 0){
+			       		$errorMess .= "\tNo seeds were found for use"; 
+			       }
+	        	       my %error = {"e" => $errorMess};
+	        	       return \%error;
+	               }
+
+	       }
+
+	}
+	else{
+		if($numSeeds < $req_num_seeds){
+			$errorMess = "This protein has less than the required number of seed proteins and will not run";
+	        	my %error = {"e" => $errorMess};
+	        	return \%error;
+		
+		}
+		
+		
+	}
+	
+	#my %seed_hash;
+	my @length;
+	
+	foreach(@temp){
+	my $prot = ChromDB::Protein->fetch($_);
+	#need to get distinct domains
+	$seeds{$prot} = {"length" =>$prot->fetch_protein_sequence()->get_sequence_length()};
+	push(@length, $prot->fetch_protein_sequence()->get_sequence_length());
+	
+	my @doms = $prot->get_distinct_domains_by_db($db);
+	#print $prot->get_distinct_domains_by_db("pfam");
+	#print ChromDB::Domain->fetch($doms[0])->get_name()." \n";
+	foreach(@doms){
+		
+		my $domain = ChromDB::Domain->fetch($_);
+		if(exists($NF{$domain->get_name()})){
+           		#print "works";
+			my @prot_domain = $prot->fetch_domain_specs($domain->get_id());  
+                	#print @prot_domain[0]->get_e_value()."\n";
+			
+			if(scalar(@prot_domain) > 1){
+			#this where you need to check for multiple domains
+				#print scalar(@prot_domain);
+			#check if number in NF == the scalar @prot_dom
+				#if they match just go through and add all
+				if($NF{$domain->get_name()} == scalar(@prot_domain)){
+					
+					my $count =0;
+					foreach(@prot_domain){
+						my $pd = $_;
+						if(exists($seed_feat{$domain->get_name()})){
+							if($count == 0){
+						  	       #print $prot->get_chromdb_syn()." if 2 ".$domain->get_name()."\n";
+			                          	     my @f = @{$seed_feat{$domain->get_name()}};
+							     my $eval;
+							     if($pd->get_e_value() == 0){
+							     	$eval = -2**31-1;
+							     }
+							     else{
+							     	$eval = log10($pd->get_e_value());
+							     }
+							     
+			                      	  	     push(@f, $eval);
+							     if(exists($seeds{$prot})){
+						       			my %inner = %{$seeds{$prot}};
+									$inner{$domain->get_name()} = $eval;
+									$seeds{$prot} = \%inner;
+						       		}else{
+							     		$seeds{$prot} = {$domain->get_name() => $eval};
+			                      	  	     	}
+							     $seed_feat{$domain->get_name()} = \@f;
+						      	}
+							else{
+								if(exists($seed_feat{$domain->get_name()."|".$count})){
+					  	                 	#print $prot->get_chromdb_syn()." else 2".$domain->get_name()."\n";
+					  	      	        	my @f = @{$seed_feat{$domain->get_name()."|".$count}};
+									
+									 my $eval;
+							     		if($pd->get_e_value() == 0){
+							     			$eval = -2**31-1;
+							     		}
+							     		else{
+							     			$eval = log10($pd->get_e_value());
+							     		}
+									
+			                  	     	 	 	push(@f, $eval);
+									if(exists($seeds{$prot})){
+						       				my %inner = %{$seeds{$prot}};
+										$inner{$domain->get_name()."|".$count} = $eval;
+										$seeds{$prot} = \%inner;
+						       			}else{
+										$seeds{$prot} = {$domain->get_name()."|".$count => $eval};
+			                               			}
+			                  	      	      		 $seed_feat{$domain->get_name()."|".$count} = \@f;
+					  	      		}
+								else{
+									#print $prot->get_chromdb_syn()." else 3".$domain->get_name()."\n";
+									my @f;
+									
+									 my $eval;
+							     		if($pd->get_e_value() == 0){
+							     			$eval = -2**31-1;
+							     		}
+							     		else{
+							     			$eval = log10($pd->get_e_value());
+							     		}
+									
+			                               			push(@f, $eval);
+									if(exists($seeds{$prot})){
+						       				my %inner = %{$seeds{$prot}};
+										$inner{$domain->get_name()."|".$count} = $eval;
+										$seeds{$prot} = \%inner;
+						       			}else{
+										$seeds{$prot} = {$domain->get_name()."|".$count => $eval};
+			                               			}
+									$seed_feat{$domain->get_name()."|".$count} = \@f;
+								}
+							}
+						      $count++;
+						}
+			               	        else{
+							
+			               	               #if the hash requires a key entry add it and starting value
+			                               my @f;
+						       
+						        my $eval;
+							     if($pd->get_e_value() == 0){
+							     	$eval = -2**31-1;
+							     }
+							     else{
+							     	$eval = log10($pd->get_e_value());
+							     }
+						       
+			                               push(@f, $eval);
+						       if(exists($seeds{$prot})){
+						       		my %inner = %{$seeds{$prot}};
+								$inner{$domain->get_name()} = $eval;
+								$seeds{$prot} = \%inner;
+						       }else{
+						       		$seeds{$prot}={$domain->get_name() => $eval};
+			                               }
+						       $seed_feat{$domain->get_name()} = \@f;
+						       $count++;
+							#print $prot->get_chromdb_syn()." else 1".$domain->get_name()."\n";
+			               	        }
+					
+					}
+				}
+				#if not....??			
+				else{
+					#take as many as are in NF in order
+					my $numDom = $NF{$domain->get_name()};
+					
+					
+					
+					for(my $d = 0; $d < $numDom; $d++){
+						#print "\n\n$tester\tDomain name: ".$domain->get_name()."\n";
+						if(!$prot_domain[$d]){
+							next;
+						}
+						#add multiples in order seperate out in 						
+						
+						if(exists($seed_feat{$domain->get_name()})){
+							if($d !=0){
+			                              my @f = @{$seed_feat{$domain->get_name()}};
+						      	
+							print ChromDB::Protein->fetch($tester)->get_chromdb_syn()." fails at domain ".$domain->get_name()."\n";
+							print $prot_domain[$d]." d is $d \n";
+							print "Num dom = $numDom\n";
+						       my $eval;
+							     if($prot_domain[$d]->get_e_value() == 0){
+							     	$eval = -2**31-1;
+							     }
+							     else{
+							     	$eval = log10($prot_domain[$d]->get_e_value());
+							     }
+						      
+			                      	      push(@f, $eval);
+			                      	      
+						      $seed_feat{$domain->get_name()."|".$d} = \@f;
+						      
+						      		if(exists($seeds{$prot})){
+					       				my %inner = %{$seeds{$prot}};
+									$inner{$domain->get_name()."|".$d} = $eval;
+									$seeds{$prot} = \%inner;	
+								}else{
+									$seeds{$prot} = {$domain->get_name()."|".$d => $eval};
+								}
+						      #print $NF{$domain->get_name()}."\t";
+						      #print $d."\t";
+						      	}
+							else{
+							my @f = @{$seed_feat{$domain->get_name()}};
+							
+							my $eval;
+							     if($prot_domain[$d]->get_e_value() == 0){
+							     	$eval = -2**31-1;
+							     }
+							     else{
+							     	$eval = log10($prot_domain[$d]->get_e_value());
+							     }
+							
+							push(@f, $eval);
+								
+								if(exists($seeds{$prot})){
+					       				my %inner = %{$seeds{$prot}};
+									$inner{$domain->get_name()} = $eval;
+									$seeds{$prot} = \%inner;	
+								}else{
+									$seeds{$prot} = {$domain->get_name() => $eval};
+								}
+			                      	      	$seed_feat{$domain->get_name()} = \@f;
+							}
+			               		}
+			               	        else{
+			               	               #if the hash requires a key entry add it and starting value
+			                                my @f;
+							
+							my $eval;
+							     if($prot_domain[0]->get_e_value() == 0){
+							     	$eval = -2**31-1;
+							     }
+							     else{
+							     	$eval = log10($prot_domain[0]->get_e_value());
+							     }
+							
+			                                push(@f, $eval);
+			                                $seed_feat{$domain->get_name()} = \@f;
+							#my @a = @{$seed_feat{$domain->get_name()}};
+							if(exists($seeds{$prot})){
+					       			my %inner = %{$seeds{$prot}};
+								$inner{$domain->get_name()} = $eval;
+								$seeds{$prot} = \%inner;	
+							}else{
+								$seeds{$prot} = {$domain->get_name() => $eval};
+							}
+							#print "@a\n";
+							#print $d."\t";
+							#print "here3\n";
+			               	        }
+					
+					}
+				}
+				
+			}
+			else{
+				#if the key is already in the hash just a value
+					if(exists($seed_feat{$domain->get_name()})){
+			                       my @f = @{$seed_feat{$domain->get_name()}};
+					       
+					       my $eval;
+							     if($prot_domain[0]->get_e_value() == 0){
+							     	$eval = -2**31-1;
+							     }
+							     else{
+							     	$eval = log10($prot_domain[0]->get_e_value());
+							     }
+					       
+			                       push(@f,$eval);
+			                       $seed_feat{$domain->get_name()} = \@f;
+					       if(exists($seeds{$prot})){
+					       	my %inner = %{$seeds{$prot}};
+						
+						$inner{$domain->get_name()} = $eval;
+						$seeds{$prot} = \%inner;
+						#print Dumper(%seeds);
+					       	#print "TRUE2\n";
+					       }
+					       else{
+					       $seeds{$prot}={$domain->get_name()=>$eval};
+					       }
+			               }
+			               else{
+			               #if the hash requires a key entry add it and starting value
+			                       my @f;
+					       
+					       my $eval;
+							     if($prot_domain[0]->get_e_value() == 0){
+							     	$eval = -2**31-1;
+							     }
+							     else{
+							     	$eval = log10($prot_domain[0]->get_e_value());
+							     }
+					       
+			                       push(@f, $eval);
+			                       $seed_feat{$domain->get_name()} = \@f;
+					       #$seed_hash{$domain->get_name()} = log10(@prot_domain[0]->get_e_value());
+					       if(exists($seeds{$prot})){
+					       	my %inner = %{$seeds{$prot}};
+						
+						$inner{$domain->get_name()} = $eval;
+						$seeds{$prot} = \%inner;
+						#print Dumper(%seeds);
+					       	#print "TRUE2\n";
+					       }
+					       else{
+					       $seeds{$prot}={$domain->get_name()=>$eval};
+					       }
+						#need to fix rest of hash this way from seed hash!!!####
+			               }
+				}	     
+               		}
+			
+			#my @keys = keys(%seed_feat);
+			
+			#			print $prot->get_name."\t"."@keys\n";
+			#			<>;
+		}
+		
+		#$seeds{$prot} =  \%seed_hash;
+		#%seed_hash = {};
+	}
+	$seed_feat{"length"} = \@length;
+	
+	if($verbose == 1){
+			print "\n";
+		foreach my $key (keys(%seed_feat)){
+			print " Key = $key \n";
+			print " Value = ".scalar(@{$seed_feat{$key}})."\n";
+		}
+		
+			print "the seeds used are:\n";
+			
+		foreach(@temp){
+			my $prot = ChromDB::Protein->fetch($_);
+			print $prot->get_chromdb_syn();
+			print "\n";
+		
+		}	
+	
+	}
+	
+	%seed_feat = %{ChromDB::QualityAssessment->necessary_feature_check(\%seed_feat, $numSeeds)};
+	
+	if(scalar(keys(%seed_feat)) == 1){
+		my @key  = keys(%seed_feat);
+		$errorMess = "Seeds contain only 1 necessary feature: ".$key[0];
+		return \%seed_feat;
+	}
+	
+	%feat_test = %seed_feat;
+	return \%seed_feat;
+}# get seeds
+
+#takes in the canidate features and compares to see if it has at least
+#the necessary features in order to continue
+sub has_necessary_features(){
+	my $self = shift;
+	my $hash_ref = shift;
+	my %can_feat= %{$hash_ref};
+	my @missing_feat;
+	my %feat_to_use;
+	my $multi_domain =0;
+	
+	
+	#if using seeds remove the domains that dont match even if the other seeds have
+			#since this seed is feature limit
+		
+			if($seed_test == 1){
+			
+				foreach my $key(keys(%necessary_features)){
+					
+					if(exists($can_feat{$key})){
+						next;
+					}
+					elsif($key =~ m/(\w*)\|(\d)/){
+						my $temp_key = $1;
+						my $number = $2;
+						
+						if(exists($necessary_features{$temp_key}) && $necessary_features{$temp_key} > $number){
+							next;	
+						}
+					}
+					else{
+						
+							#print "$key is beiong removed\n";
+						
+					
+						delete $necessary_features{$key};
+						## need to update seed list here
+						##
+						##
+						##
+						if($verbose == 1){
+							print scalar(keys(%necessary_features));
+							print "\n";
+						
+						}
+					}
+				
+				}
+				
+				if($verbose == 1){
+					print "\n the keys are\n";
+					print keys(%necessary_features);
+					print "\n";
+				}
+			
+			}
+	
+		
+
+	#outer loop of canidate features (domains at this point)
+	foreach my $key(keys(%can_feat)){
+		
+		if(exists($necessary_features{$key})){
+			$feat_to_use{$key} = $can_feat{$key};	
+		}
+		
+		else{
+			#possible multiple domains...
+			if($key =~ m/(\w*)\|(\d)/){
+				my $temp_key = $1;
+				my $number = $2;
+				$multi_domain = 1;
+				if(exists($necessary_features{$temp_key}) && $necessary_features{$temp_key} > $number){
+					$feat_to_use{$key} = $can_feat{$key};	
+				}
+			
+			}
+			
+			#or domains does not exist in necessary features
+		
+		}
+	
+	}
+	
+	
+	
+	
+	
+	
+	
+	#return hash of canidate features to use
+	
+	if(keys(%feat_to_use) == keys(%necessary_features)){
+		
+		#print "Necessary features met".keys(%feat_to_use);
+		$has_features = 1;
+		return \%feat_to_use;
+	}
+	elsif($multi_domain == 1){
+		my $total=0;
+		
+		foreach my $k (keys(%necessary_features)){
+			$total += $necessary_features{$k};
+		
+		}
+		if(keys(%feat_to_use) == $total){
+			$has_features = 1;
+			return \%feat_to_use;
+		}
+		else{
+			foreach my $key(keys(%necessary_features)){
+			
+			unless(exists($feat_to_use{$key})){
+				push(@missing_feat, $key);
+			}
+			#print $key;
+			}
+			#print @missing_feat;
+			return @missing_feat;
+		
+		}
+	}
+	
+	
+	#if lacking the needed features return missing features
+	else{
+		#find missing features by matching seed features to 
+		#canidate added features to find whats missing
+		
+		foreach my $key(keys(%necessary_features)){
+			
+			unless(exists($feat_to_use{$key})){
+				push(@missing_feat, $key);
+			}
+			#print $key;
+		}
+		#print @missing_feat;
+		return @missing_feat;
+	}
+}
+			
+#calculate seed values
+sub calc_seed_values(){	#return: void
+	my $self = shift;
+	my $hash_ref = shift;
+	my %seeds = %{$hash_ref}; #assumes a hash with array refs inside
+	my @z_minus_zbar;
+	#preform the same calculations pre-MHND
+	
+	
+	my $i = 0;
+	#for each seed get nth feature 
+	foreach my $key (keys(%seeds)){
+		push(@order, $key);
+		#add to temp array 
+		my @temp = @{$seeds{$key}};
+		if($verbose == 1){
+			print "keys is $key and array is @temp\n";
+		}
+		#calculate stats(seeds)
+		#print "$key ".$temp[0]."\t";
+		my $z_difference = ChromDB::QualityAssessment->stat_calc(\@temp, "seed", $key);
+		#print "z-zbar of $key\n";
+		#print $z_difference;
+		#print "\n\n";
+		
+		#store result in @z_minus_zbar
+		push(@z_minus_zbar, $z_difference);
+	}	
+	
+	#generate matrix (seeds) -> varible
+	
+	ChromDB::QualityAssessment->generate_matrix(\@z_minus_zbar);
+	if($errorMess){
+		return;
+	}
+	#if user does not provide dmax, calculate it
+	if(!$d_max){
+		ChromDB::QualityAssessment->d_max_cutoff();
+	}
+	
+} 	#end calc_seed_values();
+
+sub calc_canidate_values(){
+	my $self = shift;
+	my $hash_ref = shift;
+	my %canidate_vals = %{$hash_ref};
+	my @calc_pdl;
+	
+	if($verbose ==1){
+		print " The canidate z scores are\n";
+	
+	}
+	#calculate stats (canidate)
+	foreach(@order){
+		my $key = $_;
+		my $temp = $canidate_vals{$key};
+		my $z_diff = pdl(ChromDB::QualityAssessment->stat_calc($temp, "canidate", $key));
+		if($verbose == 1){
+			print "the keys is ".$key." the zscore - zbar is \n";
+			print $z_diff;
+			print "\n";
+		
+		}
+		my @zdims = dims($z_diff);
+		
+		push(@calc_pdl, $z_diff->at(0));
+		
+	}
+	
+	#create vector -> varible (this is done in the z_vector method
+	ChromDB::QualityAssessment->generate_z_vector_matrix(\@calc_pdl);
+	if($co_var_defined == 1){
+		return ChromDB::QualityAssessment->calculate_mhnd();
+	}
+	else{
+		$errorMess = "Error in operations S^-1 has not been defined";
+		return;
+	}
+}	#end candicate calculation
+			
+
+#calculations for stats(feature)
+sub stat_calc(){
+	my $self = shift;
+	my $input = shift; #array of features 1 feature at a time
+	#print "".$input[0];
+	my $type = shift; #canidate vs seed
+	#this is only needed if the canidate is being processed
+	my $feature = shift;
+	
+	#need to check to see if they are domains to log10 them
+	
+	
+	my $piddle = PDL->new($input);
+	#print $piddle." is piddle\n";
+	#crate matrix in pdl to do calculations	
+	my $mean;	#x bar - average
+	my $std;	#sigma - standard deviation
+	my $z_bar;	#z_bar - average of the z_scores
+	
+	if($type =~ m/canidate/i){
+		$mean = $averages_of_features{$feature};
+		$std = $stds_of_features{$feature};
+		$z_bar = $z_bars_of_features{$feature};
+	
+	}	
+	#subroutine to calculate mean (private) M
+	if($type =~ m/seed/i){
+		$mean  = davg($piddle);
+		$averages_of_features{$feature} = $mean;
+	
+
+	#subroutine to calculate standard deviation (private) S
+	# std = sqrt((sum(x-x_bar)^2)/(n-1))
+		my $pdl_avg = $piddle-$mean;
+		
+		#print $type;
+		$std = sqrt((dsum($pdl_avg**2))/(scalar(@{$input})-1));
+		$stds_of_features{$feature} =  $std;
+		
+	}
+	#input - mean (of input feature)
+	my $mean_diff = $piddle-$mean;
+	
+	#standarize input() Z
+		#subroutine to calculate zscore (private)
+		#z = (x-x_bar)/std 
+		
+	my $z_score = $mean_diff/$std;	
+	
+	if($type =~ m/canidate/i && $feature eq "length"){
+		$canidate_z_length = $z_score;
+	}
+	
+	my $z_diff; 	
+	#calculate zbar 
+	if($type =~ m/seed/i){
+		push(@seed_z_scores, $z_score);
+		$z_bar = davg($z_score);
+		$z_bars_of_features{$feature} = $z_bar;
+		
+	}	
+		
+	#diff_z = zscore - the mean of the zscores
+	$z_diff = $z_score-$z_bar;
+	
+	if( $type =~ m/seed/i){
+		if(!($z_bar <= .00001 && $z_bar >= -.00001)){
+			if($verbose ==1){
+			print "DATA ILLCONDTIONTED at z sum\n";
+			}
+		}
+		
+	}
+	#print $z_diff."\n";
+	return $z_diff;
+	
+}	#end stat_calc()
+	
+#matrix position calculation : returns 2D array = covariance matrix
+sub matrix_position_calc(){ 
+	my $self = shift;
+	
+	my $piddles = shift;
+	#print "\n";
+	#print @{$piddles}[0]."array ref?";
+	my @z_piddles = @{$piddles};
+	
+	#consider putting an array of bad values to skip when calulating the
+	#covariance matrix may get hairy though: solution remove it before it gets to the calulations
+	if(@bad_feat){
+		
+		for(my $b =0; $b < @bad_feat; $b++){
+			splice(@z_piddles, $bad_feat[$b], 1);
+		
+		} 
+		
+	}
+	
+	my @calcs;
+	#PDL - This can be redone, better with the piddle and the at method
+	
+		#S_pos_1 x S_pos_2
+		#array of zdiff piddles
+		# n will be the number of seeds or the size of the piddle
+			#use dims for this
+		# 1/(num seeds-1) * sum((zdiff_feat1_seed1 * zdiff_feat2_seed1) + seed2 same info)
+		# where 1 and 2 are the position in the matrix, work row by row to make use of the 2d array
+		if(scalar(@z_piddles) == 1){
+			$errorMess = "seeds only have one feature: @order";
+			return;
+		}
+		
+		if($verbose){
+			print "\n";
+			
+			my $seeds = ChromDB::QualityAssessment->generate_seed_list(\@seed_prots);
+			
+			print $seeds."\n";
+			
+			foreach(@order){
+				print $_."\n";
+			
+			}
+		
+		}
+		
+		
+		for(my $col = 0; $col < @z_piddles; $col++){
+			my @temp;
+			
+			for(my $row = 0; $row <@z_piddles; $row++){
+			
+				if($verbose){
+					print "Number of seeds = $numSeeds\n";
+					print "z_piddle at row $row = \n";
+					print $z_piddles[$row];
+					print "\n";
+					print "z_piddle at column $col = \n";
+					print $z_piddles[$col];
+					print "\n";
+					
+				}
+			
+				my $pos = (1/(scalar($numSeeds)-1))*dsum($z_piddles[$row]*$z_piddles[$col]);
+				#print "sum = ".dsum($z_piddles[$row]*$z_piddles[$col])."\n";
+				push(@temp, $pos);
+			}
+		
+			push(@calcs, \@temp);
+		}
+		
+		#(1/(n-1))*sum->from (1 to n){ (z_pos_1_k - z_bar_pos_1)*(z_pos_2_k - z_bar_pos_2) }
+	
+		my $cvm = mpdl(@calcs);
+		my $dummy = $cvm;
+		#print $dummy;
+		my ($a, $con, $b) = geco($dummy);
+		#print $con."\n";
+		#print geco($dummy);
+		if($verbose == 1){
+			print (log($con)/log(10));
+			print " or $con is condition of ".ChromDB::Protein->fetch($tester)->get_chromdb_syn()."\n";
+			print $cvm;
+		}
+		
+		
+		
+	
+		if($verbose == 0 && log10($con) <= -9){
+			my $prot_name = ChromDB::Protein->fetch($tester)->get_chromdb_syn();
+			my $copy = $cvm;
+			my ($a, $con, $b) = geco($copy);
+			
+			print $con;
+			print " is the condtion number\n";
+			
+			print "\n".log10($con)." log 10 base score\n";
+			
+			
+				print "Co-Var matrix for $prot_name\n";
+			
+				print $cvm;
+			
+			
+				print "\nTHE CONDITION NUMBER OF $prot_name IS $con\n\n";
+			
+			
+			
+			print "\n";
+			print "\nDeterminant is\t".det($cvm)."\n";
+			
+			if(det($cvm) != 0){
+			
+			print "this is what the inverse should be\n";
+			print inv($cvm);
+			print "\n";
+			}
+		}
+		
+		if(log10($con) <= -9){
+			#print "SHINKAGE ESTIMATOR CALLED\n";
+			
+			
+			$cvm = shrink($cvm, \@z_piddles);
+		}
+		
+	#print "HERE!!!\n";
+	return $cvm;
+	
+	#[s1^2	s21	sn1 ]
+	#[s12	s2^2	sn2 ]
+	#[s1n	s2n	sn^2]
+		
+}	#end matrix_position_calc()
+
+#create matrix
+sub generate_matrix(){
+	my $self = shift;
+	
+	my @z_scores = shift;
+		
+	#calculate matrix position and use array to build S (co-variance matrix)
+	
+	my $co_var_matrix = ChromDB::QualityAssessment->matrix_position_calc(@z_scores);
+	#print $co_var_matrix;
+	if($co_var_matrix =~ m/seeds.*/){
+		return $co_var_matrix;
+	}
+	#check for sqare and det = 0
+	my $zero_check = ChromDB::QualityAssessment->zero_matrix_check($co_var_matrix);
+	if($zero_check != 1){
+		#need to figure out what to do when its
+		if($zero_check =~ m/\d*\sx\s\d*/){
+			#since the modeule is handling necessary features this should never happen
+			#more a saftey net
+			#dimensions error
+			
+			$errorMess =  "There are missing nessary features the matrix is $zero_check";
+			return;
+		}
+		elsif($zero_check =~ m/Singular\smatrix.*/){
+			my $name = ChromDB::Protein->fetch($tester)->get_chromdb_syn();
+			$errorMess =  $zero_check." for $name ";
+			return;
+		}
+		elsif($zero_check =~ m/Determinant.*/){
+			$errorMess = $zero_check;
+			return;
+		}
+		else{
+			#det = 0 error
+			$co_var_matrix = ChromDB::QualityAssessment->matrix_position_calc(@z_scores);
+		}
+	
+	}
+	
+	#insert qualtiy check and shrinkage call here
+	$co_var_matrix = ChromDB::QualityAssessment->shrink_check($co_var_matrix);
+	
+	#invert checkd matrix to get S^-1
+	#print ChromDB::Protein->fetch($tester)->get_chromdb_syn();
+	#print "\nS\n";
+	#print $co_var_matrix;
+	#print "\n";
+	#my @t = keys(%necessary_features);
+	
+	#print "@t\n";
+	#############################
+	#print $co_var_matrix;
+	#print ChromDB::Protein->fetch($tester)->get_chromdb_syn();
+	#print @order;
+	#my ($sing, $perm, $par) = lu_decomp($co_var_matrix);
+	#print "$sing\n";
+	#print "$perm\n";
+	#print "$par\n";
+	#<>;
+	#print det($co_var_matrix);
+	#print "\n";
+	#print det($sing);
+	#	if(det($sing) == 0 || $par == -1){
+	#		#die "Singular matrix";
+	#		$errorMess = "\tMatrix decomp detected";
+	#		return;
+	#	}
+	my $inverse_matrix = inv($co_var_matrix);
+	
+	if($verbose == 1){
+		print "\nThis after the covariance matrix is inverted\n";
+		print $inverse_matrix;
+	}
+	
+	
+	$matrix = $inverse_matrix;
+	$co_var_defined = 1;
+}	
+					
+#check matrix for zero feature
+sub zero_matrix_check() {
+	my $self = shift;
+		#store co-variance matrix
+	
+	my $curr_matrix = shift;
+	
+	#check if determinant = 0
+	#or at least ensure that software dose
+	
+	#also need to check if the matrix is square.
+	my @dimensions = dims($curr_matrix);
+	my $col = $dimensions[0];
+	my $row = $dimensions[1];
+	if($row != $col){
+		#if covariance matrix is not square the dimensions are returned 
+		
+		return $row." x ".$col;
+		
+	} 
+	
+	
+	if($row ==1 && $col==1){
+		my @t = keys(%necessary_features);
+		return "Singular matrix created cannot take inverse necessary features are @t";
+	
+	}
+	
+	#check matrix - best to check diagnol sqares to figure out 
+	#which featuer is causing the zero
+		#if there is a zero()
+			#remove feature from set
+			#create matrix()
+	#print "Determinant =  ".det($matrix)."\n";
+	print $curr_matrix;
+	
+	if(det($curr_matrix) == 0 || det($curr_matrix) == -0){
+		#use the 2D array that came with the matrix and remake the matrix
+		my @to_delete;
+		
+		#check x^2 to find which features need to be removed
+		for( my $i=0; $i < $dimensions[0]; $i++){
+		
+			if($curr_matrix->at($i,$i) == 0){
+				push(@to_delete, $i);
+				#print $order[$i];
+				
+			}
+		}
+		#if there are zeroes in the matrix the feature number is returned
+		if(@to_delete){
+				@bad_feat = @to_delete;
+			return \@to_delete;
+		}
+		else{
+			my $protName = ChromDB::Protein->fetch($tester)->get_chromdb_syn();
+			return " Determinant is zero with out Zero feature";
+		} 
+		
+	}
+			
+	
+	return 1;
+		
+	
+}# end Zero check
+
+sub shrink_check(){
+	my $self = shift;
+	my $co_var = shift;
+	my $shrink = 0;
+
+	#check to see that there are all ones in the diagonal
+	my @dims = dims($co_var);
+	#print "Dimensions are".$dims[0]."\n";
+	for(my $j =0; $j <$dims[0]; $j++){
+	
+		for(my $k =0; $k <$dims[0]; $k++){
+		
+			if($j==$k){
+				my $diag = $co_var->at($j,$k);
+					
+				if( $diag ne 1 ){
+					if($diag !~ m/0\.[9]*/){
+						$shrink = 1;
+					 	#print "diag at position $j , $k, is ".$diag."\n";
+					 }
+				}
+			}
+			else{
+				my $num = $co_var->at($j,$k);
+				if($num > 1 || $num < -1){
+					$shrink =2;
+					#print "number at position $j , $k, is ".$num."\n";
+				}
+			}
+		
+		}#end inner for
+		
+	}#end for
+	
+	if($shrink ==1){
+		if($verbose ==1){
+		print "Data is illconditioned\n";
+		print $co_var."\n";
+		}
+		
+	}
+	#if not shrink towards idenity matrix
+	if($shrink == 2){
+		if($verbose ==1){
+		print "shrinkage needed\n";
+		#print $co_var."\n";
+		}
+	}
+	#reuturn the new matrix
+	return $co_var;
+}#end Shrink check
+
+#should retrun a column or nX1 matrix
+sub generate_z_vector_matrix(){
+	my $self = shift;
+	my $z_vector = shift;
+	my @calc_z = @{$z_vector};
+	
+	if(@bad_feat){
+		if($verbose ==1){
+		print "bad feat?";
+		}
+		for(my $b =0; $b < @bad_feat; $b++){
+			splice(@calc_z, $bad_feat[$b], 1);
+		} 
+	}
+	
+	#creates a n x 1 matric of z-z_bar of canidate data
+	$vector = vpdl(@calc_z);
+
+	#check the dimensions to see if you need to transpose before sending
+	# no good wayt to check dims only retruns 1 number not a 0 x 4 or
+	# 4 x 0
+
+} #end generate z vector
+
+		
+
+#calculate MHND
+sub calculate_mhnd(){
+	my $self = shift;	
+	my $z_vector = $vector;
+	my $s_inverse = $matrix;
+	#print "S^-1\n";
+	#print $matrix;
+	#print "\n";
+	#print "z vector\n";
+	#print $z_vector;
+	#print "\n";
+	my $num_vars = scalar(@order);
+	
+	my $transpose = transpose($z_vector);
+	#print "transpose\n";
+	#print $transpose;
+	#print "\n";
+	#print $z_vector;
+	#D^2(candidate protein) = 1/p (z - z_bar)^T (S^-1) (z- z_bar)
+	#		p= num varibles = number of predictors of number of features
+	#		should be row matrix X S^-1 X column matrix 
+	#		(need to make sure or you will get an error)  
+	my $mhnd = sqrt((1/sqrt($num_vars)) *( ($transpose) x $s_inverse x ($z_vector)));
+	
+	if($verbose == 1){
+		print "\nFOR NAN CASE\n";
+		my $nan = (1/sqrt($num_vars)) *( ($transpose) x $s_inverse x ($z_vector));
+		print $nan;
+		print "\n";
+	
+		print "\nMHND CALCS\n";
+		
+		print "coeffient = ";
+		print (1/$num_vars);
+		print "\n";
+		print "transpose\n";
+		print $transpose;
+		print "\nS^-1\n";
+		print $s_inverse;
+		print "\nz_vector\n";
+		print $z_vector;
+		print "\n";
+	
+	}
+	#print "MHND\n";
+	#print $mhnd."\n";
+	return $mhnd;
+}
+
+sub d_max_cutoff() {
+	my $max = 0;
+	
+	#print Dumper(%seeds)."\n";
+	
+	foreach my $key (keys(%seeds)){
+		#print $key."\n";
+		my $temp = $seeds{$key};
+		my %hash = %{$temp};
+		#print Dumper(%hash);
+		
+		my $dist = ChromDB::QualityAssessment->calc_canidate_values(\%hash);
+		#print $dist;
+		if($dist->at(0,0) > $max){
+			$max = $dist->at(0,0);
+		}
+		#print keys(%{$temp});
+		#print ChromDB::Protein->fetch($tester)->get_chromdb_syn()."\t".$max."\n";
+	}
+	
+	$d_max = $max;
+	
+	#print "Dmax == ".$d_max."\n";
+}
+
+
+#Return to user
+sub generate_output(){
+	#this will now return a hash of values to the script
+	my $self = shift;
+	my $distance = shift;
+	my $mhnd = $distance->at(0,0);
+	my %return_hash;
+	my $color;
+	my $color_sq;
+	#return hash of findings to script;
+		
+		#length zscore	(
+		
+		##for eache of these use a match statement to either capture the number you want or remove
+		## the extra digits
+		
+		$return_hash{"z length"} = ChromDB::QualityAssessment->rounder($canidate_z_length);
+
+	#spacial scores (are we still doing colors?) yes
+		#MHND
+		$return_hash{"MHND"} = ChromDB::QualityAssessment->rounder($mhnd);
+		#D max (spacial seed limit)
+		$return_hash{"D max"} = ChromDB::QualityAssessment->rounder($d_max);
+		
+		#spacial score (color)
+		if($mhnd <= $d_max){
+			$color = "GREEN";
+		}
+		elsif ($mhnd <= ($d_max * 2)){
+			$color = "YELLOW"
+		}
+		else{
+			$color = "RED";
+		}
+		$return_hash{"MHND color"} = $color;
+		
+	#Chi^2 scores (same question of colors) yes
+		
+		
+		#MHND^2
+		my $mhnd_sq = ($mhnd)*($mhnd);
+		$return_hash{"MHND^2"} = ChromDB::QualityAssessment->rounder($mhnd_sq);
+		
+		#chi^2 score (color)
+		my ($rank, $a) = dims($matrix);
+		my $alpha_cut_off = ChromDB::QualityAssessment->rounder(Statistics::Distributions::chisqrdistr ($rank,$alpha));
+		my $gamma_cut_off = ChromDB::QualityAssessment->rounder(Statistics::Distributions::chisqrdistr ($rank,$gamma));
+		
+		$return_hash{"alpha"} = $alpha_cut_off;
+		$return_hash{"gamma"} = $gamma_cut_off;
+		
+		if($mhnd_sq <= $alpha_cut_off){
+			$color_sq = "GREEN";
+		}
+		elsif ($mhnd_sq <= $gamma_cut_off){
+			$color_sq = "YELLOW"
+		}
+		else{
+			$color_sq = "RED";
+		}
+		
+		$return_hash{"D^2 color"} = $color_sq;
+		
+		
+		
+		my $seed_list = ChromDB::QualityAssessment->generate_seed_list(\@seed_prots);
+		
+		
+		$return_hash{"Seed List"} = $seed_list;
+		
+		return \%return_hash;
+}
+
+sub rounder(){
+	my $self = shift;
+	my $number = shift;
+	
+	if($number =~ m/(\d*\.\d\d)\d*/){
+		$number = $1;
+	}
+	
+	return $number;
+
+}
+
+sub generate_seed_list(){
+	my $self = shift;
+	#print $self."\n";
+	my $seeds_ref = shift;
+	my @seeds = @{$seeds_ref};
+	#print scalar(@seeds)."\n";
+	my $list;
+		
+		for(my $i=0; $i<scalar(@seeds); $i++){
+			$list .= ChromDB::Protein->fetch($seeds[$i])->get_chromdb_syn();
+			unless($i == (scalar(@seeds)-1)){
+				$list .= ", ";
+			
+			}
+			
+		}
+		
+	return $list;
+}
+
+
+
+sub necessary_feature_check(){
+	my $self = shift;
+	my $hash_ref = shift;
+	my $num_prot = shift;
+	
+	#print "HERE";
+	
+	my %nec_fet = %{$hash_ref};
+	
+	foreach my $key (keys(%nec_fet)){
+			my $num_val = scalar(@{$nec_fet{$key}});
+			print $num_val." is num val and num_prot is $num_prot\n";
+			if($num_val != $num_prot){
+				#print "here?";
+				
+				if($verbose ==1){
+					print "\n$key is being removed from the necessary features from ".ChromDB::Protein->fetch($tester)->get_chromdb_syn()."\n";
+				}
+				
+				delete $nec_fet{$key};
+			}
+	}
+	
+	return \%nec_fet;
+	
+}
+
+
+sub shrink(){
+	
+	
+	if($verbose ==0){
+		print "\n BEGINING SHRINKAGE HERE\n";
+	}
+	
+	my $local_matrix = shift;
+	my $zpdl = shift;
+	print $matrix;
+	my @z = @{$zpdl};
+	
+	my $d = calc_dvect($local_matrix);
+	if($verbose ==0){
+		print "\nThis is d $d \n";
+	}
+	my $b = calc_bbar($local_matrix, \@z);
+	if($verbose ==0){
+		print "\nThis is b $b \n";
+	}
+	#min of d^2 and b_line^2
+	my $b_sq;
+	
+	if($b > $d){
+		$b_sq = $d;
+	}
+	else{
+		$b_sq = $b;
+	}
+	
+	if($verbose ==0){
+		print "This is b^2 $b_sq \n";
+	
+		print "d^2 - b_bar".($d-$b);
+		print "\n";
+	}
+		
+	if(($d - $b) < 0){
+		#throw ERROR!
+		#if($verbose == 1){
+			print $local_matrix;
+			
+			print @order;
+			#my $dup = $local_matrix;
+			#my ($a, $con, $b) = geco($dup);
+			print "\nmoving to ident ".ChromDB::Protein->fetch($tester)->get_chromdb_syn()."\n";
+		}
+		#return $local_matrix;
+		
+		########## USING THE COROLATION CORRECTION ###################
+=for			while( log($con)/log(10) < -4){ 
+				print "about to corefix\n";
+				my $returner = core_fix($matrix, \@pdl);
+				print "after corefix\n";
+				#print "anew $returner";
+
+				if($returner == -1){
+					last;
+				}
+
+				if(ref($returner) eq "HASH"){
+ 	        	     		print "WORKING\n";
+ 	 		     	     my %hash = %{$returner};
+ 	 			     #print keys(%hash);
+ 	 			     my @keys = keys %hash;
+ 	 			     #print scalar(@keys);
+ 	 			     my @sorted = reverse sort @keys;
+ 	 			     print @sorted."this is sorted";
+ 	 			     print $sorted[0];
+ 	 			     print $hash{1}."\n";
+ 	 			     shift(@sorted);
+ 	 			     foreach(@sorted){
+ 	 				     print $_." A\n";
+ 	 			     }
+
+ 	 			     my @coor = @{$hash{@sorted[0]}};
+ 	 			     #print @coor."\n";
+ 	 			     my $cor1 = @coor[0];
+ 	 			     my $cor2 = @coor[1];
+
+
+					#if allwoing user to define values
+					#compare to domains that should be there and next the next highest 
+					#ones and average
+					#else{
+					#edit hash with feature values
+					my $new_pdl = (@pdl[$cor1] + @pdl[$cor2])/2;
+					print $new_pdl;
+	
+					@pdl[$cor1] = $new_pdl;
+					delete(@pdl[$cor2]);
+					while($cor2 < scalar(@pdl)-2){
+						@pdl[$cor2] = @pdl[$cor2+1];
+						$cor2++;
+					}
+					pop(@pdl);
+	
+					my $z_ref = z_pdl(\@pdl);
+					@z= @{$z_ref};
+
+					print @z;
+	
+					my @co_var = covar(\@z);
+
+					my $matrix = mpdl(@co_var);
+					print $matrix;
+	
+					($dum, $con, $dum2) = geco($matrix);
+					print "CONDITION = $con\n";
+	
+					#combine/avg values of 2 indexes
+				}
+				else{
+	     			 #delete whole feature
+
+	       				 print "DELETING RETURNER! $returner\n";
+	        			while($returner < scalar(@pdl)-1){
+	        				@pdl[$returner] = @pdl[$returner+1];
+	        				$returner++;
+	        			}
+	        			pop(@pdl);
+
+
+	     				   my $z_ref = z_pdl(\@pdl);
+	       				 @z= @{$z_ref};
+	       				 print @z;
+
+	      				  my @co_var = covar(\@z);
+
+	      				  my $matrix = mpdl(@co_var);
+	       				 print $matrix;
+
+	       				 ($dum, $con, $dum2) = geco($matrix);
+	       				 print "CONDITION = $con\n";
+
+
+				}
+
+			}  
+	}
+	else{
+=cut	
+	       my @dims = dims($local_matrix);
+
+	       my $ident = identity($dims[0], $dims[1]);
+	       if($verbose ==1){
+	               print $ident."\n";
+	       }
+	       my $new_matrix = (($b_sq/$d)*$ident + (($d-$b_sq)/$d)*$local_matrix);
+
+	       if($verbose == 0){
+	               print "\n New matrix is\n";
+	               print $new_matrix;
+	               print "\n";
+	       }
+	#}
+	
+	return $new_matrix;
+}
+
+sub calc_dvect(){
+	my $matrix = shift;
+	
+	#print "MATRIX + ".$matrix."\n";;
+	
+	#print "DIAG ".$matrix->diagonal(0,1)."\n";
+	
+	
+	my $d = ($matrix x $matrix);
+	
+	my @dims =  dims($matrix);
+	
+	#print "DIAG ".$d->diagonal(0,1)."\n";
+	
+	$d = dsum($d->diagonal(0,1));
+	
+	$d = $d/$dims[0];
+	
+	$d = $d -1;
+	 # should greater than
+	return $d;
+
+}
+
+sub calc_bbar(){
+	my $matx = shift;
+	my $z_vects = shift;
+	
+	if($verbose == 1){
+		print "\n MATRIX IS \n";
+	
+		print $matx;
+	}
+	
+	my @z_pdls = @{$z_vects};
+	
+	#when this goes in the module it should be changed to keys(%seeds);
+ 	my $num_seeds = scalar(@seed_prots);
+	
+	# make sure this coinsides with the feature number as the co_var
+	my @position;
+	#print "ENTERING LOOPS \n";
+	
+	my @dims = dims($z_pdls[0]);
+	
+	if($verbose == 1){
+		print "Dims are ".$dims[0]."and ".scalar(@dims)."\n";
+	}
+	
+	for(my $i =0; $i < $num_seeds; $i++){
+		my @as = ();
+		
+		for(my $j =0; $j < @order; $j++){
+			
+			
+			my $a = $z_pdls[$j]->at($i);
+			my @bs = ();
+			for(my $k =0; $k < @order; $k++){
+				
+				my $b = $z_pdls[$k]->at($i);
+				my $temp = 0;
+				
+				my @temp_dims = dims($matx);
+				#print "ERROR1? $j , $k ".$temp_dims[0]."\n";
+				#print @z_pdls."\n";
+				
+				$temp = ($a*$b - $matx->at($j,$k));
+				$temp = $temp*$temp;
+				if($verbose ==1){
+					print "TEMP IS ".$temp."\n";
+				}
+				push(@bs, $temp);
+			}
+			my $vpdl = dsum(vpdl(@bs));
+			
+			if($verbose == 1){
+				print "VPDL= ".$vpdl."\n";
+			}
+			push(@as, $vpdl);
+		}
+		
+		my $apdl = dsum(vpdl(@as));
+		
+		if($verbose ==1){
+			print "APDL = ".$apdl."\n";
+		}
+		push(@position, $apdl);
+	}
+	
+	my $final = dsum(vpdl(@position));
+	$final = (1/(scalar(@z_pdls) * scalar(@order))) *$final;
+	if($verbose ==1){
+		print "FINAL IS ".$final."\n\n";
+	}
+	return $final;
+
+}
+
+sub core_fix(){
+ #$self = shift;
+
+ my $matrix = shift;
+ my $seed_ref = shift;
+ 
+ my $highest = 0.7;
+ 
+ my @seeds = @{$seed_ref};
+ my %cor = {};
+ 
+ my $count;
+ 
+ my $size = scalar(@seeds);
+ 
+ #check for bad domain first 2x for loops
+ for(my $k =0; $k <$size; $k++){
+ 	my $r = $k;
+	my $t;
+	for($t = $k; $t < $size; $t++){
+		if($t == $r && $matrix->at($t,$r) =~ m/nan/i){
+			return $t;
+		}
+		
+		if($t == $r){
+		print $t."\n";
+			last;
+		}
+		if(abs($matrix->at($t,$r)) >$highest){
+			$count++;
+		}
+		
+	
+	}
+	
+	for($r; $r< $size; $r++){
+		if(abs($matrix->at($t,$r)) >$highest){
+			$count++;
+		}
+	
+	}
+	
+	if($count == scalar(@seeds)-1){
+		print "DELETE $t";
+		#return spot to delete
+		return $t;
+	}
+ 
+ 
+ }
+ 
+ #get all bad corrilations if no domain is found to remove
+
+my $row = 0;
+my $col = 0;
+
+OUTER: for(my $i = 0; $i < $size; $i++){
+		
+		INNER: for(my $j = ($i+1); $j <$size; $j++){
+			my $a = $matrix->at($i,$j);
+			
+			if(abs($a) > $highest){
+				my @current  = ();
+				$row = $i;
+				$col = $j;
+				push(@current, $row);
+				push(@current, $col);
+				$cor{abs($matrix->at($i,$j))} = \@current;
+				
+			}
+			
+		}
+	}
+	#sort time
+
+	#print sort keys(%cor);
+	
+	print keys(%cor)." THESE ARE KEYS\n";
+	#print "\n";
+	if( keys(%cor) >0){
+		return \%cor;
+	}
+	else{
+		return -1;
+	}
+
+}
+
+1;
